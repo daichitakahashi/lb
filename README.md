@@ -1,6 +1,6 @@
 # Study of Load Balancer in Go
 
-## Load map
+## Road map
 
 1. Round Robin
 2. Least Connection
