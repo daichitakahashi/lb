@@ -2,10 +2,11 @@ package server
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"sync/atomic"
+	"sync"
 
 	"github.com/daichitakahashi/lb/config"
 )
@@ -24,15 +25,21 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 		backends = append(backends, b)
 	}
 
-	h := &roundRobin{
+	l := &BackendList{
 		backends: backends,
-		l:        uint64(len(backends)),
 	}
-	h.cur--
+	s := RoundRobinSelector{}
 
 	return &http.Server{
-		Addr:    conf.Listen,
-		Handler: h,
+		Addr: conf.Listen,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, err := s.Select(l, r)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, err.Error())
+			}
+			b.ServeHTTP(w, r)
+		}),
 	}, nil
 }
 
@@ -54,14 +61,60 @@ func newBackend(s config.BackendConfig) (*Backend, error) {
 	}, nil
 }
 
-type roundRobin struct {
-	cur      uint64
+var ErrBackendNotSelected = errors.New("backend is not selected")
+
+type BackendList struct {
+	m        sync.RWMutex
 	backends []*Backend
-	l        uint64
 }
 
-func (rr *roundRobin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	i := atomic.AddUint64(&rr.cur, 1) % rr.l
-	b := rr.backends[i]
-	b.ServeHTTP(w, r)
+func (l *BackendList) Add(b *Backend) {
+	l.m.Lock()
+	defer l.m.Unlock()
+	l.backends = append(l.backends, b)
+}
+
+func (l *BackendList) Remove(b *Backend) {
+	l.m.Lock()
+	defer l.m.Unlock()
+	n := 0
+	for _, bb := range l.backends {
+		if bb == b {
+			continue
+		}
+		l.backends[n] = bb
+		n++
+	}
+	l.backends = l.backends[:n]
+}
+
+func (l *BackendList) Candidates() []*Backend {
+	l.m.RLock()
+	defer l.m.RUnlock()
+
+	// return healthy backends
+	return l.backends
+}
+
+type Selector interface {
+	Select(list *BackendList, req *http.Request) (*Backend, error)
+}
+
+type RoundRobinSelector struct {
+	m   sync.Mutex
+	cur uint64
+}
+
+func (r *RoundRobinSelector) Select(list *BackendList, _ *http.Request) (*Backend, error) {
+	c := list.Candidates()
+	l := uint64(len(c))
+	if l == 0 {
+		return nil, ErrBackendNotSelected
+	}
+
+	r.m.Lock()
+	defer r.m.Unlock()
+	b := c[r.cur%l]
+	r.cur++
+	return b, nil
 }
