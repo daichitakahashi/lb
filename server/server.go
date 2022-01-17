@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/daichitakahashi/lb/config"
+	"github.com/rs/xid"
 )
 
 func NewServer(conf *config.Config) (*http.Server, error) {
@@ -28,12 +29,25 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 	l := &BackendList{
 		backends: backends,
 	}
-	s := RoundRobinSelector{}
+	s := []Selector{
+		&CookieSelector{
+			CookieName: "LB-Persistence",
+		},
+		&RoundRobinSelector{},
+	}
 
 	return &http.Server{
 		Addr: conf.Listen,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			b, err := s.Select(l, r)
+			var b *Backend
+			var err error
+			for _, ss := range s {
+				b, err = ss.Select(l, w, r)
+				if err == ErrBackendNotSelected {
+					continue
+				}
+				break
+			}
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = io.WriteString(w, err.Error())
@@ -44,6 +58,7 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 }
 
 type Backend struct {
+	ID string
 	http.Handler
 }
 
@@ -53,10 +68,15 @@ func newBackend(s config.BackendConfig) (*Backend, error) {
 		return nil, err
 	}
 
+	if s.ID == "" {
+		s.ID = xid.New().String()
+	}
+
 	// TODO: ping
 
 	p := httputil.NewSingleHostReverseProxy(u)
 	return &Backend{
+		ID:      s.ID,
 		Handler: p,
 	}, nil
 }
@@ -97,7 +117,7 @@ func (l *BackendList) Candidates() []*Backend {
 }
 
 type Selector interface {
-	Select(list *BackendList, req *http.Request) (*Backend, error)
+	Select(list *BackendList, w http.ResponseWriter, r *http.Request) (*Backend, error)
 }
 
 type RoundRobinSelector struct {
@@ -105,16 +125,44 @@ type RoundRobinSelector struct {
 	cur uint64
 }
 
-func (r *RoundRobinSelector) Select(list *BackendList, _ *http.Request) (*Backend, error) {
+func (s *RoundRobinSelector) Select(list *BackendList, _ http.ResponseWriter, _ *http.Request) (*Backend, error) {
 	c := list.Candidates()
 	l := uint64(len(c))
 	if l == 0 {
 		return nil, ErrBackendNotSelected
 	}
 
-	r.m.Lock()
-	defer r.m.Unlock()
-	b := c[r.cur%l]
-	r.cur++
+	s.m.Lock()
+	defer s.m.Unlock()
+	b := c[s.cur%l]
+	s.cur++
 	return b, nil
+}
+
+type CookieSelector struct {
+	CookieName string
+}
+
+func (s *CookieSelector) Select(list *BackendList, w http.ResponseWriter, r *http.Request) (*Backend, error) {
+	c, err := r.Cookie(s.CookieName)
+	if err != nil {
+		return nil, ErrBackendNotSelected
+	}
+
+	// cookie validation?
+
+	candidates := list.Candidates()
+	for _, b := range candidates {
+		if b.ID == c.Value {
+			// Set-Cookie with new selected Backend's ID
+			http.SetCookie(w, &http.Cookie{
+				Name:  s.CookieName,
+				Value: b.ID,
+			})
+			return b, nil
+		}
+	}
+
+	// persisted backend is missing
+	return nil, ErrBackendNotSelected
 }

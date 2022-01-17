@@ -20,5 +20,6 @@ func Load(r io.Reader) (*Config, error) {
 }
 
 type BackendConfig struct {
+	ID  string `json:"id"`
 	URL string `json:"url"`
 }
