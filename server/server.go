@@ -53,7 +53,7 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 				lb:       lb,
 				next:     0,
 			}
-			_, err := ctx.Next(w, r)
+			_, err := ctx.Next(w, r, nil)
 			if err != nil {
 				status := http.StatusServiceUnavailable
 				if err != ErrBackendNotSelected {
@@ -68,7 +68,7 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 
 type Backend struct {
 	ID string
-	http.Handler
+	*httputil.ReverseProxy
 }
 
 func newBackend(s config.BackendConfig) (*Backend, error) {
@@ -85,8 +85,8 @@ func newBackend(s config.BackendConfig) (*Backend, error) {
 
 	p := httputil.NewSingleHostReverseProxy(u)
 	return &Backend{
-		ID:      s.ID,
-		Handler: p,
+		ID:           s.ID,
+		ReverseProxy: p,
 	}, nil
 }
 
@@ -127,23 +127,48 @@ func (l *BackendList) Candidates() []*Backend {
 
 type Context struct {
 	context.Context
-	backends *BackendList
-	lb       []LoadBalancer
-	next     int // next index of lb
+	backends  *BackendList
+	lb        []LoadBalancer
+	next      int // next index of lb
+	modifiers []ModifyResponse
 }
 
 func (c *Context) Candidates() []*Backend {
 	return c.backends.Candidates()
 }
 
-func (c *Context) Proxy(b *Backend, w http.ResponseWriter, r *http.Request) {
+type ModifyResponse func(b *Backend, resp *http.Response) error
+
+func (c *Context) modifyResponse(b *Backend) func(*http.Response) error {
+	if len(c.modifiers) == 0 {
+		return nil
+	}
+	return func(resp *http.Response) error {
+		for _, m := range c.modifiers {
+			err := m(b, resp)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func (c *Context) Proxy(b *Backend, w http.ResponseWriter, r *http.Request, modify ModifyResponse) {
+	if modify != nil {
+		c.modifiers = append(c.modifiers, modify)
+	}
+	b.ModifyResponse = c.modifyResponse(b) // FIXME: not goroutine safe
 	b.ServeHTTP(w, r)
 }
 
-func (c *Context) Next(w http.ResponseWriter, r *http.Request) (*Backend, error) {
+func (c *Context) Next(w http.ResponseWriter, r *http.Request, modify ModifyResponse) (*Backend, error) {
 	cc := *c
 	lb := cc.lb[cc.next]
 	cc.next++
+	if modify != nil {
+		cc.modifiers = append(cc.modifiers, modify)
+	}
 	return lb.ServeBalancing(&cc, w, r)
 }
 
@@ -178,7 +203,7 @@ func (s *roundRobin) ServeBalancing(ctx *Context, w http.ResponseWriter, r *http
 	s.cur++
 	s.m.Unlock()
 
-	ctx.Proxy(b, w, r)
+	ctx.Proxy(b, w, r, nil)
 	return b, nil
 }
 
@@ -193,31 +218,27 @@ func CookiePersistence(name string) LoadBalancer {
 }
 
 func (s *cookie) ServeBalancing(ctx *Context, w http.ResponseWriter, r *http.Request) (*Backend, error) {
-	c, err := r.Cookie(s.n)
-	if err != nil {
-		b, err := ctx.Next(w, r)
-		if err != nil {
-			return nil, err
-		}
+	if c, err := r.Cookie(s.n); err == nil {
+		// cookie validation?
 
-		// Set-Cookie with new selected Backend's ID
-		http.SetCookie(w, &http.Cookie{
+		candidates := ctx.Candidates()
+		for _, b := range candidates {
+			if b.ID == c.Value {
+				ctx.Proxy(b, w, r, nil)
+				return b, nil
+			}
+		}
+	}
+
+	// cookie not exists
+	// or persisted backend is missing
+	return ctx.Next(w, r, func(b *Backend, resp *http.Response) error {
+		c := http.Cookie{
 			Name:  s.n,
 			Value: b.ID,
-		})
-		return b, nil
-	}
-
-	// cookie validation?
-
-	candidates := ctx.Candidates()
-	for _, b := range candidates {
-		if b.ID == c.Value {
-			ctx.Proxy(b, w, r)
-			return b, nil
+			Path:  "/",
 		}
-	}
-
-	// persisted backend is missing
-	return ctx.Next(w, r)
+		resp.Header.Add("Set-Cookie", c.String())
+		return nil
+	})
 }
