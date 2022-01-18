@@ -6,8 +6,10 @@ import (
 )
 
 type Config struct {
-	Listen   string          `json:"listen"`
-	Backends []BackendConfig `json:"backends"`
+	Listen            string          `json:"listen"`
+	Algorithm         string          `json:"algorithm"`
+	PersistenceMethod string          `json:"persistenceMethod"`
+	Backends          []BackendConfig `json:"backends"`
 }
 
 func Load(r io.Reader) (*Config, error) {
