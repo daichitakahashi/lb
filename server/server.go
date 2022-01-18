@@ -25,14 +25,24 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 		}
 		backends = append(backends, b)
 	}
-
 	l := &BackendList{
 		backends: backends,
 	}
-	lb := []LoadBalancer{
-		RoundRobin(),
-		base{},
+
+	lb := make([]LoadBalancer, 0, 3)
+	switch conf.PersistenceMethod {
+	case "cookie":
+		lb = append(lb, CookiePersistence("LB-Session"))
 	}
+
+	switch conf.Algorithm {
+	case "round-robin":
+		lb = append(lb, RoundRobin())
+	default:
+		return nil, errors.New("algorithm not specified")
+	}
+
+	lb = append(lb, base{})
 
 	return &http.Server{
 		Addr: conf.Listen,

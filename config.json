@@ -1,5 +1,7 @@
 {
   "listen": ":3000",
+  "algorithm": "round-robin",
+  "persistenceMethod": "cookie",
   "backends": [
     {
       "url": ""
