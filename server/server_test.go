@@ -59,6 +59,9 @@ func TestRoundRobin(t *testing.T) {
 		_ = resp.Body.Close()
 		buf.Write(body)
 		buf.WriteRune('\n')
+		if resp.StatusCode != http.StatusOK {
+			t.Fatal("status code is not 200: ", lb.URL)
+		}
 	}
 
 	result := buf.String()
