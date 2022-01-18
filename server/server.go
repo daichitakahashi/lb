@@ -158,8 +158,25 @@ func (c *Context) Proxy(b *Backend, w http.ResponseWriter, r *http.Request, modi
 	if modify != nil {
 		c.modifiers = append(c.modifiers, modify)
 	}
-	b.ModifyResponse = c.modifyResponse(b) // FIXME: not goroutine safe
-	b.ServeHTTP(w, r)
+
+	/*
+		// Using sync.Mutex
+		m := c.modifyResponse(b)
+		b.m.Lock()
+		b.ModifyResponse = func(resp *http.Response) error {
+			defer b.m.Unlock()
+			if m == nil {
+				return nil
+			}
+			return m(resp)
+		}
+		b.ServeHTTP(w, r)
+	*/
+
+	// Copy httputil.ReverseProxy
+	p := *b.ReverseProxy
+	p.ModifyResponse = c.modifyResponse(b)
+	p.ServeHTTP(w, r)
 }
 
 func (c *Context) Next(w http.ResponseWriter, r *http.Request, modify ModifyResponse) (*Backend, error) {
