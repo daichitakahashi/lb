@@ -1,9 +1,11 @@
 # Study of Load Balancer in Go
 
-## Road map
+## TODO
 
-1. Round Robin
-2. Least Connection
-3. Persistence
-4. Retry
-5. Health Check
+- [x] Round Robin
+- [ ] Least Connection
+- [x] Cookie-based Persistence
+- [ ] IP hash Persistence
+- [ ] Retry
+- [ ] Health Check
+- [ ] Discovery?
