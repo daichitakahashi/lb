@@ -1,8 +1,8 @@
 package server
 
 import (
+	"context"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -29,30 +29,29 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 	l := &BackendList{
 		backends: backends,
 	}
-	s := []Selector{
-		&CookieSelector{
-			CookieName: "LB-Persistence",
-		},
-		&RoundRobinSelector{},
+	lb := []LoadBalancer{
+		RoundRobin(),
+		base{},
 	}
 
 	return &http.Server{
 		Addr: conf.Listen,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			var b *Backend
-			var err error
-			for _, ss := range s {
-				b, err = ss.Select(l, w, r)
-				if err == ErrBackendNotSelected {
-					continue
-				}
-				break
+			ctx := &Context{
+				Context:  r.Context(),
+				backends: l,
+				lb:       lb,
+				next:     0,
 			}
+			_, err := ctx.Next(w, r)
 			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = io.WriteString(w, err.Error())
+				status := http.StatusServiceUnavailable
+				if err != ErrBackendNotSelected {
+					status = http.StatusInternalServerError
+				}
+				w.WriteHeader(status)
+				return
 			}
-			b.ServeHTTP(w, r)
 		}),
 	}, nil
 }
@@ -116,53 +115,99 @@ func (l *BackendList) Candidates() []*Backend {
 	return l.backends
 }
 
-type Selector interface {
-	Select(list *BackendList, w http.ResponseWriter, r *http.Request) (*Backend, error)
+type Context struct {
+	context.Context
+	backends *BackendList
+	lb       []LoadBalancer
+	next     int // next index of lb
 }
 
-type RoundRobinSelector struct {
+func (c *Context) Candidates() []*Backend {
+	return c.backends.Candidates()
+}
+
+func (c *Context) Proxy(b *Backend, w http.ResponseWriter, r *http.Request) {
+	b.ServeHTTP(w, r)
+}
+
+func (c *Context) Next(w http.ResponseWriter, r *http.Request) (*Backend, error) {
+	cc := *c
+	lb := cc.lb[cc.next]
+	cc.next++
+	return lb.ServeBalancing(&cc, w, r)
+}
+
+type LoadBalancer interface {
+	ServeBalancing(ctx *Context, w http.ResponseWriter, r *http.Request) (*Backend, error)
+}
+
+type base struct{}
+
+func (b base) ServeBalancing(_ *Context, _ http.ResponseWriter, _ *http.Request) (*Backend, error) {
+	return nil, ErrBackendNotSelected
+}
+
+type roundRobin struct {
 	m   sync.Mutex
 	cur uint64
 }
 
-func (s *RoundRobinSelector) Select(list *BackendList, _ http.ResponseWriter, _ *http.Request) (*Backend, error) {
-	c := list.Candidates()
+func RoundRobin() LoadBalancer {
+	return &roundRobin{}
+}
+
+func (s *roundRobin) ServeBalancing(ctx *Context, w http.ResponseWriter, r *http.Request) (*Backend, error) {
+	c := ctx.Candidates()
 	l := uint64(len(c))
 	if l == 0 {
 		return nil, ErrBackendNotSelected
 	}
 
 	s.m.Lock()
-	defer s.m.Unlock()
 	b := c[s.cur%l]
 	s.cur++
+	s.m.Unlock()
+
+	ctx.Proxy(b, w, r)
 	return b, nil
 }
 
-type CookieSelector struct {
-	CookieName string
+type cookie struct {
+	n string
 }
 
-func (s *CookieSelector) Select(list *BackendList, w http.ResponseWriter, r *http.Request) (*Backend, error) {
-	c, err := r.Cookie(s.CookieName)
+func CookiePersistence(name string) LoadBalancer {
+	return &cookie{
+		n: name,
+	}
+}
+
+func (s *cookie) ServeBalancing(ctx *Context, w http.ResponseWriter, r *http.Request) (*Backend, error) {
+	c, err := r.Cookie(s.n)
 	if err != nil {
-		return nil, ErrBackendNotSelected
+		b, err := ctx.Next(w, r)
+		if err != nil {
+			return nil, err
+		}
+
+		// Set-Cookie with new selected Backend's ID
+		http.SetCookie(w, &http.Cookie{
+			Name:  s.n,
+			Value: b.ID,
+		})
+		return b, nil
 	}
 
 	// cookie validation?
 
-	candidates := list.Candidates()
+	candidates := ctx.Candidates()
 	for _, b := range candidates {
 		if b.ID == c.Value {
-			// Set-Cookie with new selected Backend's ID
-			http.SetCookie(w, &http.Cookie{
-				Name:  s.CookieName,
-				Value: b.ID,
-			})
+			ctx.Proxy(b, w, r)
 			return b, nil
 		}
 	}
 
 	// persisted backend is missing
-	return nil, ErrBackendNotSelected
+	return ctx.Next(w, r)
 }
