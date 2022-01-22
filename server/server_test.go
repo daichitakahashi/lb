@@ -78,6 +78,10 @@ server 2
 	}
 }
 
+func TestLeastConnection(t *testing.T) {
+	t.Skip("not implemented")
+}
+
 type persistedClient struct {
 	*http.Client
 	content []byte

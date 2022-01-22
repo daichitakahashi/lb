@@ -23,6 +23,7 @@ import (
 
 func BenchmarkModifyResponse(b *testing.B) {
 	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// w.Header().Add("Connection", "Close")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("response"))
 	}))

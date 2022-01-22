@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"sync/atomic"
 
 	"github.com/daichitakahashi/lb/config"
 	"github.com/rs/xid"
@@ -17,9 +20,12 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 		return nil, errors.New("no backend")
 	}
 
+	t := http.DefaultTransport.(*http.Transport)
+	t.MaxIdleConnsPerHost = 10
+
 	backends := make([]*Backend, 0, len(conf.Backends))
 	for _, s := range conf.Backends {
-		b, err := newBackend(s)
+		b, err := newBackend(s, t.Clone())
 		if err != nil {
 			return nil, err
 		}
@@ -38,6 +44,8 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 	switch conf.Algorithm {
 	case "round-robin":
 		lb = append(lb, RoundRobin())
+	case "least-connection":
+		lb = append(lb, LeastConnection())
 	default:
 		return nil, errors.New("algorithm not specified")
 	}
@@ -66,28 +74,83 @@ func NewServer(conf *config.Config) (*http.Server, error) {
 	}, nil
 }
 
-type Backend struct {
-	ID string
-	*httputil.ReverseProxy
+type countConn struct {
+	net.Conn
+	count *uint64
 }
 
-func newBackend(s config.BackendConfig) (*Backend, error) {
-	u, err := url.Parse(s.URL)
-	if err != nil {
-		return nil, err
-	}
+func (c *countConn) Close() error {
+	defer atomic.AddUint64(c.count, ^uint64(0)) // decrement
+	// fmt.Println("close")
+	return c.Conn.Close()
+}
 
-	if s.ID == "" {
-		s.ID = xid.New().String()
+type Backend struct {
+	*httputil.ReverseProxy
+	ID    string
+	conns uint64
+}
+
+func newBackend(s config.BackendConfig, t *http.Transport) (*Backend, error) {
+	b := Backend{
+		ID: s.ID,
+	}
+	if b.ID == "" {
+		b.ID = xid.New().String()
 	}
 
 	// TODO: ping
 
-	p := httputil.NewSingleHostReverseProxy(u)
-	return &Backend{
-		ID:           s.ID,
-		ReverseProxy: p,
-	}, nil
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		return nil, err
+	}
+	b.ReverseProxy = httputil.NewSingleHostReverseProxy(u)
+	dial := t.DialContext
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		added := atomic.AddUint64(&b.conns, 1)
+		_ = added
+		// fmt.Println(b.ID, "count:", added)
+
+		return &countConn{
+			Conn:  conn,
+			count: &b.conns,
+		}, nil
+	}
+	b.ReverseProxy.Transport = t
+
+	d := b.ReverseProxy.Director
+	b.ReverseProxy.Director = func(r *http.Request) {
+		d(r)
+		ctx := httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
+			GetConn: nil,
+			GotConn: func(info httptrace.GotConnInfo) {
+				// fmt.Println("GotConn")
+				// fmt.Println(info.Conn.RemoteAddr().String())
+				// fmt.Printf("%#v\n", info)
+				if info.Reused {
+					// fmt.Println(b.ID, "reused")
+				} else {
+					// fmt.Println(b.ID, "new")
+				}
+			},
+			PutIdleConn:      nil,
+			ConnectStart:     nil,
+			ConnectDone:      nil,
+			WroteHeaderField: nil,
+			WroteHeaders:     nil,
+		})
+		*r = *r.WithContext(ctx)
+	}
+	return &b, nil
+}
+
+func (b *Backend) Conns() uint64 {
+	return atomic.LoadUint64(&b.conns)
 }
 
 var ErrBackendNotSelected = errors.New("backend is not selected")
@@ -134,6 +197,7 @@ type Context struct {
 }
 
 func (c *Context) Candidates() []*Backend {
+	// TODO: determine context candidates
 	return c.backends.Candidates()
 }
 
@@ -208,20 +272,59 @@ func RoundRobin() LoadBalancer {
 	return &roundRobin{}
 }
 
-func (s *roundRobin) ServeBalancing(ctx *Context, w http.ResponseWriter, r *http.Request) (*Backend, error) {
-	c := ctx.Candidates()
-	l := uint64(len(c))
+func (s *roundRobin) next(list []*Backend) (int, *Backend, error) {
+	l := uint64(len(list))
 	if l == 0 {
-		return nil, ErrBackendNotSelected
+		return 0, nil, ErrBackendNotSelected
 	}
 
 	s.m.Lock()
-	b := c[s.cur%l]
+	idx := s.cur % l
+	b := list[idx]
 	s.cur++
 	s.m.Unlock()
+	return int(idx), b, nil
+}
 
+func (s *roundRobin) ServeBalancing(ctx *Context, w http.ResponseWriter, r *http.Request) (*Backend, error) {
+	c := ctx.Candidates()
+	_, b, err := s.next(c)
+	if err != nil {
+		return nil, err
+	}
 	ctx.Proxy(b, w, r, nil)
 	return b, nil
+}
+
+type leastConnection struct {
+	*roundRobin
+}
+
+func LeastConnection() LoadBalancer {
+	return &leastConnection{
+		roundRobin: &roundRobin{},
+	}
+}
+
+func (s *leastConnection) ServeBalancing(ctx *Context, w http.ResponseWriter, r *http.Request) (*Backend, error) {
+	c := ctx.Candidates()
+	l := len(c)
+	ni, n, err := s.roundRobin.next(c)
+	if err != nil {
+		return nil, err
+	}
+
+	minValue := n.Conns()
+	for i := ni + 1; i%l != ni; i++ {
+		b := c[i%l]
+		if conns := b.Conns(); minValue > conns {
+			n = b
+			minValue = conns
+		}
+	}
+
+	ctx.Proxy(n, w, r, nil)
+	return n, nil
 }
 
 type cookie struct {
